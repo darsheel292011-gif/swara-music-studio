@@ -18,9 +18,6 @@ import streamlit as st
 
 PITCH_NAMES = ["C", "C♯ / D♭", "D", "D♯ / E♭", "E", "F", "F♯ / G♭", "G", "G♯ / A♭", "A", "A♯ / B♭", "B"]
 HINDUSTANI = ["Sa", "komal Re", "Re", "komal Ga", "Ga", "Ma", "tivra Ma", "Pa", "komal Dha", "Dha", "komal Ni", "Ni"]
-CARNATIC = ["Sa", "Ri₁", "Ri₂ / Ga₁", "Ri₃ / Ga₂", "Ga₃", "Ma₁", "Ma₂", "Pa", "Da₁", "Da₂ / Ni₁", "Da₃ / Ni₂", "Ni₃"]
-MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 MAX_BYTES = 200 * 1024 * 1024
 MAX_SECONDS = 20 * 60
 SAMPLE_RATE = 22050
@@ -52,8 +49,6 @@ class Result:
     confidence: np.ndarray
     counts: np.ndarray
     tonic_pc: int
-    key: str
-    key_strength: float
     events: list[tuple[float, float, int, float]]
 
 
@@ -142,19 +137,6 @@ def decode_upload(data: bytes, filename: str) -> tuple[np.ndarray, int, bytes]:
     return mono, int(sr), preview.getvalue()
 
 
-def _key_estimate(counts: np.ndarray) -> tuple[str, float]:
-    if np.std(counts) < 1e-8:
-        return "Unclear", 0.0
-    candidates: list[tuple[float, str]] = []
-    for root in range(12):
-        for mode, profile in (("major", MAJOR_PROFILE), ("minor", MINOR_PROFILE)):
-            corr = float(np.corrcoef(counts, np.roll(profile, root))[0, 1])
-            candidates.append((corr, f"{PITCH_NAMES[root]} {mode}"))
-    candidates.sort(reverse=True)
-    strength = max(0.0, min(1.0, (candidates[0][0] - candidates[1][0]) * 2.5))
-    return candidates[0][1], strength
-
-
 def analyze(audio: np.ndarray, sr: int) -> Result:
     if sr != SAMPLE_RATE:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
@@ -175,8 +157,6 @@ def analyze(audio: np.ndarray, sr: int) -> Result:
     weighted_counts = np.bincount(pcs, weights=weights, minlength=12)
     smooth_counts = weighted_counts + 0.25 * np.roll(weighted_counts, 1) + 0.25 * np.roll(weighted_counts, -1)
     tonic_pc = int(np.argmax(smooth_counts))
-    key, key_strength = _key_estimate(weighted_counts)
-
     # Merge nearby frames into approximate note events; tolerate brief vibrato and tiny tracking gaps.
     notes = np.rint(midi).astype(int)
     events: list[tuple[float, float, int, float]] = []
@@ -190,15 +170,42 @@ def analyze(audio: np.ndarray, sr: int) -> Result:
                 note = int(np.rint(np.median(midi[start:idx])))
                 events.append((begin, finish, note, float(np.mean(weights[start:idx]))))
             start = idx
-    return Result(len(audio) / sr, times, midi, weights, smooth_counts, tonic_pc, key, key_strength, events)
+    return Result(len(audio) / sr, times, midi, weights, smooth_counts, tonic_pc, events)
 
 
-def note_label(midi: int) -> str:
-    return f"{PITCH_NAMES[midi % 12]}{midi // 12 - 1}"
+def reference_sa_midi(midi_notes: np.ndarray, tonic_pc: int) -> int:
+    """Choose the Sa register nearest the song's typical melody register."""
+    middle = int(np.rint(np.median(midi_notes)))
+    shift = (tonic_pc - middle) % 12
+    if shift > 6:
+        shift -= 12
+    return middle + shift
 
 
-def tonic_label(pc: int) -> str:
-    return PITCH_NAMES[pc].split(" /")[0]
+def sargam_label(midi: int, tonic_pc: int, reference_sa: int) -> str:
+    """Name a note relative to Sa and mark notes in lower or higher octaves."""
+    swara = HINDUSTANI[(midi % 12 - tonic_pc) % 12]
+    octave = int(np.rint((midi - reference_sa) / 12))
+    marker = "↓ " if octave < 0 else ("↑ " if octave > 0 else "")
+    return f"{marker}{swara}"
+
+
+def practice_phrases(events: list[tuple[float, float, int, float]], tonic_pc: int) -> str:
+    if not events:
+        return ""
+    reference_sa = reference_sa_midi(np.array([event[2] for event in events]), tonic_pc)
+    phrases: list[str] = []
+    current: list[str] = []
+    previous_end: float | None = None
+    for start, end, note, _ in events:
+        if current and (start - (previous_end or start) > 0.55 or len(current) >= 12):
+            phrases.append("  ".join(current))
+            current = []
+        current.append(sargam_label(note, tonic_pc, reference_sa))
+        previous_end = end
+    if current:
+        phrases.append("  ".join(current))
+    return "\n".join(phrases)
 
 
 def rank_ragas(counts: np.ndarray, tonic_pc: int) -> list[tuple[str, float]]:
@@ -225,7 +232,7 @@ header[data-testid="stHeader"] { background:transparent; }
 .block-container { max-width:1180px; padding-top:2rem; padding-bottom:4rem; }
 h1,h2,h3 { font-family:'Manrope',sans-serif !important; letter-spacing:-.035em; color:var(--ink); }
 .hero { border-radius:28px; padding:34px 38px 30px; color:white; background:linear-gradient(115deg,#6551e9 0%,#9371fa 52%,#f07bb2 120%); box-shadow:0 18px 50px #7c65ed30; position:relative; overflow:hidden; animation:rise .55s ease-out both; }
-.hero:after { content:'♪'; position:absolute; font-size:190px; color:#ffffff18; right:38px; top:-38px; transform:rotate(12deg); }
+.hero:after { content:'♪'; position:absolute; font-size:190px; color:#ffffff18; right:38px; top:-38px; transform:rotate(12deg); animation:float-note 5s ease-in-out infinite; }
 .hero h1 { color:white !important; font-size:clamp(2.2rem,5vw,3.6rem); margin:8px 0 5px; }
 .hero p { color:#f5f0ff; font-size:1.03rem; margin:0; max-width:660px; }
 .eyebrow { color:#e7e0ff; text-transform:uppercase; letter-spacing:.16em; font-weight:700; font-size:.72rem; }
@@ -242,11 +249,14 @@ h1,h2,h3 { font-family:'Manrope',sans-serif !important; letter-spacing:-.035em; 
 .stTabs [data-baseweb="tab"] { background:#fff; border-radius:12px; padding:10px 18px; }
 div[data-testid="stDataFrame"] { border-radius:14px; overflow:hidden; }
 .section-label { color:#807b9f; text-transform:uppercase; letter-spacing:.12em; font-size:.74rem; font-weight:700; margin:18px 0 7px; }
+.octave-legend { color:#686887; background:#fff; border:1px solid #efedff; border-radius:14px; padding:11px 15px; margin:8px 0 14px; font-size:.9rem; }
 .disclaimer { background:#fff9e9; border:1px solid #ffe8ae; padding:14px 18px; border-radius:15px; color:#64552b; font-size:.9rem; }
 @keyframes rise { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+@keyframes float-note { 0%,100% { transform:translateY(0) rotate(12deg); } 50% { transform:translateY(10px) rotate(5deg); } }
+@media (max-width:640px) { .block-container { padding:1rem 1rem 3rem; } .hero { border-radius:22px; padding:25px 22px; } .hero:after { right:10px; font-size:125px; } .upload-card { padding:12px 14px 5px; } .stTabs [data-baseweb="tab"] { padding:8px 10px; } }
 @media (prefers-reduced-motion: reduce) { *,*:before,*:after { animation:none !important; transition:none !important; } }
 </style>
-<div class="hero"><div class="eyebrow">A little music, a lot of color</div><h1>Hear the notes.<br>Find your Sa.</h1><p>Drop in a song or a video with sound. Get a melody map, swara names, a tonic hint, transpose guidance, and a gentle raga shortlist.</p><span class="pill">♫ &nbsp; Your file stays in this app session</span></div>
+<div class="hero"><div class="eyebrow">A little music, a lot of color</div><h1>Hear the notes.<br>Find your Sa.</h1><p>Drop in a song or a video with sound. Get a harmonium-ready Sa Re Ga Ma melody line, note timing, a Sa hint, transpose guidance, and a gentle raga shortlist.</p><span class="pill">♫ &nbsp; Your file stays in this app session</span></div>
 """, unsafe_allow_html=True)
 st.write("")
 st.markdown('<div class="upload-card">', unsafe_allow_html=True)
@@ -257,16 +267,19 @@ st.markdown('</div>', unsafe_allow_html=True)
 if uploaded is None:
     st.write("")
     col1, col2, col3 = st.columns(3)
-    col1.markdown("**🎧 Melody map**  \nNotes with timing, Western pitch, octave, and swara names.")
+    col1.markdown("**🎧 Sargam melody map**  \nSa Re Ga Ma notes with timing and octave marks.")
     col2.markdown("**🎹 Tonic & transpose**  \nAuto-detected Sa with a manual override and semitone shift.")
     col3.markdown("**🌈 Raga ideas**  \nA cautious scale shortlist to explore, with clear limits.")
 else:
-    file_bytes = uploaded.getvalue()
-    signature = hashlib.sha256(file_bytes).hexdigest()
+    upload_id = getattr(uploaded, "file_id", None)
+    file_bytes = None if upload_id is not None else uploaded.getvalue()
+    signature = f"{upload_id}:{uploaded.name}:{uploaded.size}" if upload_id is not None else hashlib.sha256(file_bytes).hexdigest()
     st.write("")
-    st.caption(f"Selected **{uploaded.name}** · {len(file_bytes) / (1024 * 1024):.1f} MB · analyzing once…")
+    st.caption(f"Selected **{uploaded.name}** · {uploaded.size / (1024 * 1024):.1f} MB · analyzing once…")
     if st.session_state.get("analysis_signature") != signature:
         try:
+            if file_bytes is None:
+                file_bytes = uploaded.getvalue()
             with st.status("Getting your listening room ready…", expanded=True) as status:
                 st.write("Reading the audio track from your file")
                 audio, rate, preview = decode_upload(file_bytes, uploaded.name)
@@ -287,41 +300,40 @@ else:
 
     tonic_pc = result.tonic_pc
     tonics = [name.split(" /")[0] for name in PITCH_NAMES]
-    with st.expander("Know the Sa? Set it here for better swara and raga suggestions", expanded=False):
-        selected = st.selectbox("Tonic / Sa", tonics, index=tonic_pc, key=f"tonic_{signature}")
+    with st.expander("Set your Sa to match the harmonium", expanded=False):
+        st.caption("The melody is written relative to Sa. If the automatic hint is off, choose the key you want to call Sa.")
+        selected = st.selectbox("Sa key", tonics, index=tonic_pc, key=f"tonic_{signature}")
         tonic_pc = tonics.index(selected)
-        swara_style = st.radio("Swara names", ["Hindustani · Sa Re Ga Ma Pa", "Carnatic · swara positions"], horizontal=True)
-    swaras = HINDUSTANI if swara_style.startswith("Hindustani") else CARNATIC
     top_raga = rank_ragas(result.counts, tonic_pc)
-    key_strength = "more distinct" if result.key_strength >= .35 else "uncertain"
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tonic hint / Sa", tonics[tonic_pc], "automatic estimate · confirm by ear")
-    c2.metric("Likely Western key", result.key, f"profile match · {key_strength}")
-    c3.metric("Note events", f"{len(result.events):,}", "approximate melodic notes")
-    c4.metric("Top scale match", top_raga[0][0] if top_raga else "—", "exploratory shortlist")
+    c1.metric("Sa key hint", f"{tonics[tonic_pc]} · Sa", "automatic estimate · confirm by ear")
+    c2.metric("Sargam notes", f"{len(result.events):,}", "approximate melody notes")
+    c3.metric("Song length", f"{duration // 60:.0f}:{duration % 60:04.1f}", "audio track")
+    c4.metric("Top scale hint", top_raga[0][0] if top_raga else "—", "exploratory shortlist")
 
     tab_notes, tab_raga, tab_transpose = st.tabs(["🎶  Note journey", "🌺  Raga shortlist", "🎛️  Transpose"])
     with tab_notes:
         if result.events:
+            reference_sa = reference_sa_midi(np.array([event[2] for event in result.events]), tonic_pc)
             note_rows = []
             for start, end, note, confidence in result.events:
-                octave = note // 12 - 1
-                pc = note % 12
-                degree = (pc - tonic_pc) % 12
-                octave_label = "lower" if octave < 4 else ("higher" if octave > 4 else "middle")
-                note_rows.append({"From": f"{start:0.2f}s", "To": f"{end:0.2f}s", "Time": round(end - start, 2), "Western note": note_label(note), "Swara from Sa": f"{swaras[degree]} · {octave_label} octave", "Pitch confidence": f"{confidence:.0%}"})
+                note_rows.append({"Start": f"{start:0.2f}s", "End": f"{end:0.2f}s", "Duration": f"{end - start:.2f}s", "Sargam note": sargam_label(note, tonic_pc, reference_sa), "Pitch confidence": f"{confidence:.0%}"})
             notes_df = pd.DataFrame(note_rows)
+            st.markdown("### 🎹 Harmonium practice line")
+            st.caption("Play the notes from left to right. The table below shows when each note starts and ends.")
+            st.markdown('<div class="octave-legend"><b>Octave guide:</b> ↓ lower octave &nbsp; · &nbsp; no arrow = middle octave &nbsp; · &nbsp; ↑ higher octave</div>', unsafe_allow_html=True)
+            st.code(practice_phrases(result.events, tonic_pc), language=None, wrap_lines=True)
             st.dataframe(notes_df, hide_index=True, use_container_width=True, height=390)
             csv = notes_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button("⬇️ Download note map · CSV", csv, file_name="svara-note-map.csv", mime="text/csv")
         else:
             st.info("No steady note events were long enough to list. Try a clearer melody section.")
-        st.markdown('<div class="section-label">Pitch-class colors</div>', unsafe_allow_html=True)
-        pitch_df = pd.DataFrame({"Pitch": PITCH_NAMES, "Detected prominence": result.counts, "Swara": [swaras[(i - tonic_pc) % 12] for i in range(12)]})
-        fig = px.bar(pitch_df, x="Pitch", y="Detected prominence", color="Detected prominence", color_continuous_scale=["#d9d2ff", "#7357f6", "#ff79ae"], hover_data=["Swara"])
+        st.markdown('<div class="section-label">Sargam note colors</div>', unsafe_allow_html=True)
+        pitch_df = pd.DataFrame({"Sargam": HINDUSTANI, "Detected prominence": [result.counts[(tonic_pc + degree) % 12] for degree in range(12)]})
+        fig = px.bar(pitch_df, x="Sargam", y="Detected prominence", color="Detected prominence", color_continuous_scale=["#d9d2ff", "#7357f6", "#ff79ae"])
         fig.update_layout(height=300, margin=dict(l=10, r=10, t=15, b=10), coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", xaxis_title=None)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Swara labels are semitone positions relative to Sa; gamakas, tuning bends, and microtones are simplified to nearby notes.")
+        st.caption("Sargam labels are semitone positions relative to Sa; gamakas, tuning bends, and microtones are simplified to nearby notes.")
     with tab_raga:
         st.markdown('<div class="disclaimer">These are <b>scale resemblance hints</b>, not raga identification or calibrated confidence. Raga identity depends on characteristic phrases, movement rules, ornamentation, and musical context that this pitch-only version does not understand.</div>', unsafe_allow_html=True)
         raga_df = pd.DataFrame(top_raga[:5], columns=["Raga scale", "Scale resemblance · heuristic"])

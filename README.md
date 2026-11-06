@@ -6,16 +6,18 @@ A colorful, beginner-friendly Python music analyzer built with Streamlit. Choose
 
 - Accepts any file selection, then checks whether the file has a readable audio track.
 - Reads formats supported by `soundfile` directly. For seek-dependent containers such as M4A and MP4, it uses bundled FFmpeg on a temporary seekable file with network protocols disabled, then removes the temporary file.
-- Estimates a tonic (Sa) and a Western major/minor key.
-- Lists approximate melody notes with start/end time, Western note name, octave, pitch confidence, and Hindustani or Carnatic swara labels relative to Sa.
+- Shows a copyable harmonium practice line in Hindustani Sa Re Ga Ma notation, with lower- and higher-octave arrows.
+- Lists estimated sargam notes with start/end times and a pitch-tracking confidence hint; the default note display uses no Western note names.
+- Estimates a Sa key, lets you choose a different Sa, and gives the semitone shift needed to transpose to a target Sa.
 - Provides a small, experimental raga scale shortlist and a semitone transpose suggestion.
-- Exports the note table as CSV.
+- Exports the timed sargam note table as CSV.
+- Uses a colorful responsive layout, a small motion effect, and reduced animation for devices that request it.
 
 ## Limits to know
 
 Any file type can be selected so that the app can give a clear answer for unsupported files. Common formats include WAV, MP3, M4A, FLAC, OGG/Opus, AAC, AIFF, CAF, AMR, MP4, MOV, MKV, WebM, AVI, WMA, and WMV. A document or image has no song audio to analyze; a video must include an audio track and use a codec supported by FFmpeg. This version supports files up to 200 MB and songs up to 20 minutes. The uploader sends the file to the hosting service for processing, so only upload recordings you are comfortable processing there.
 
-Pitch tracking is an estimate. Polyphonic music, percussion, strong accompaniment, tuning differences, and ornamentation can confuse the melody, key, or tonic. Raga suggestions are scale resemblance hints, not calibrated confidence or perfect identification. A raga is defined by characteristic phrases, note movement, ornamentation, and musical context as well as its scale; this starter app does not analyze those features. Transpose guidance reports semitones and does not produce a modified audio file.
+Pitch tracking is an estimate. Polyphonic music, percussion, strong accompaniment, tuning differences, and ornamentation can confuse the melody or Sa. Treat the practice line as a helpful starting point and confirm it by ear, especially for songs with several instruments. Raga suggestions are scale resemblance hints, not calibrated confidence or perfect identification. A raga is defined by characteristic phrases, note movement, ornamentation, and musical context as well as its scale; this app does not fully analyze those features. Transpose guidance reports semitones and does not produce a modified audio file.
 
 ## Run on Windows 11
 
