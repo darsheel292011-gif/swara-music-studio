@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import io
 import subprocess
-import time
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import imageio_ffmpeg
 import librosa
@@ -30,6 +31,17 @@ RAGA_SCALES = {
     "Mayamalavagowla": {0, 1, 4, 5, 7, 8, 11}, "Charukesi": {0, 2, 4, 5, 7, 8, 10},
     "Keeravani": {0, 2, 3, 5, 7, 8, 11}, "Abheri": {0, 2, 3, 5, 7, 9, 10},
 }
+FFMPEG_FORMATS = {
+    ".mp3": "mp3", ".mp2": "mp3", ".wav": "wav", ".wave": "wav",
+    ".flac": "flac", ".m4a": "mov", ".mp4": "mov", ".mov": "mov",
+    ".m4v": "mov", ".3gp": "mov", ".3g2": "mov", ".aac": "aac",
+    ".ogg": "ogg", ".oga": "ogg", ".ogv": "ogg", ".opus": "ogg",
+    ".webm": "matroska", ".mkv": "matroska", ".avi": "avi",
+    ".wma": "asf", ".wmv": "asf", ".aif": "aiff", ".aiff": "aiff",
+    ".caf": "caf", ".amr": "amr", ".ac3": "ac3", ".flv": "flv",
+    ".mpg": "mpeg", ".mpeg": "mpeg", ".vob": "mpeg", ".ts": "mpegts",
+    ".mts": "mpegts", ".m2ts": "mpegts", ".mxf": "mxf",
+}
 
 
 @dataclass
@@ -45,8 +57,39 @@ class Result:
     events: list[tuple[float, float, int, float]]
 
 
+def _detect_container(data: bytes, filename: str) -> str | None:
+    """Identify common media containers before asking FFmpeg to open a file path."""
+    suffix = Path(filename).suffix.lower()
+    if suffix in FFMPEG_FORMATS:
+        return FFMPEG_FORMATS[suffix]
+    head = data[:64]
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "wav"
+    if head.startswith(b"RIFF") and head[8:12] == b"AVI ":
+        return "avi"
+    if head.startswith(b"fLaC"):
+        return "flac"
+    if head.startswith(b"OggS"):
+        return "ogg"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "mov"
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "matroska"
+    if head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
+        return "mp3"
+    if head.startswith(b"#!AMR"):
+        return "amr"
+    if head.startswith(b"caff"):
+        return "caf"
+    if head.startswith(b"FORM") and head[8:12] in (b"AIFF", b"AIFC"):
+        return "aiff"
+    if head.startswith(b"\x00\x00\x01\xba"):
+        return "mpeg"
+    return None
+
+
 def decode_upload(data: bytes, filename: str) -> tuple[np.ndarray, int, bytes]:
-    """Decode common audio/video containers. Inputs are passed to FFmpeg over a restricted pipe."""
+    """Decode common audio/video containers with a seekable temp input and network protocols disabled."""
     if not data:
         raise ValueError("That file is empty. Choose a song or a video with sound and try again.")
     if len(data) > MAX_BYTES:
@@ -63,24 +106,37 @@ def decode_upload(data: bytes, filename: str) -> tuple[np.ndarray, int, bytes]:
         audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
         mono = audio.mean(axis=1)
     except Exception:
+        container = _detect_container(data, filename)
+        if container is None:
+            raise ValueError("I couldn't recognize this as a supported audio or video format. Try MP3, WAV, M4A, FLAC, OGG, AAC, MP4, MOV, MKV, AVI, or WebM.")
         try:
-            decoded = subprocess.run(
-                [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-loglevel", "error",
-                 "-protocol_whitelist", "pipe", "-i", "pipe:0", "-map", "0:a:0", "-vn",
-                 "-t", str(MAX_SECONDS + 1), "-ac", "1", "-ar", str(SAMPLE_RATE),
-                 "-c:a", "pcm_s16le", "-f", "wav", "pipe:1"],
-                input=data, check=True, capture_output=True, timeout=240,
-            )
-            mono, sr = sf.read(io.BytesIO(decoded.stdout), dtype="float32", always_2d=True)
-            mono = mono.mean(axis=1)
+            with tempfile.TemporaryDirectory(prefix="swara_audio_") as temp_dir:
+                suffix = Path(filename).suffix.lower()
+                if not suffix or len(suffix) > 10 or not suffix[1:].isalnum():
+                    suffix = ".media"
+                input_path = Path(temp_dir) / f"upload{suffix}"
+                input_path.write_bytes(data)
+                decoded = subprocess.run(
+                    [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-loglevel", "error",
+                     "-protocol_whitelist", "file,pipe", "-protocol_blacklist", "http,https,tcp,udp,tls,rtp,rtmp,rtmps,srt",
+                     "-f", container, "-i", str(input_path), "-map", "0:a:0", "-vn",
+                     "-t", str(MAX_SECONDS + 1), "-ac", "1", "-ar", str(SAMPLE_RATE),
+                     "-c:a", "pcm_s16le", "-f", "wav", "pipe:1"],
+                    check=True, capture_output=True, timeout=240,
+                )
+                mono, sr = sf.read(io.BytesIO(decoded.stdout), dtype="float32", always_2d=True)
+                mono = mono.mean(axis=1)
         except Exception as exc:
             suffix = filename.rsplit(".", 1)[-1].upper() if "." in filename else "this file"
             raise ValueError(f"I couldn't find a readable audio track in this {suffix} file. Try MP3, WAV, M4A, FLAC, OGG, MP4, MOV, or WebM. Videos need sound; images and documents can't be analyzed as music.") from exc
     if mono.size == 0:
-        raise ValueError("No audio samples were found in this file.")
+        raise ValueError("The audio track decoded as empty. The file may be damaged or may not contain sound.")
     if len(mono) / sr > MAX_SECONDS:
         raise ValueError("This first version supports songs up to 20 minutes. Try a shorter clip.")
     mono = np.asarray(mono, dtype=np.float32)
+    mono = np.nan_to_num(mono, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.any(np.abs(mono) > 1e-7):
+        raise ValueError("The file has an audio track, but it is silent. Try another section or recording.")
     preview = io.BytesIO()
     sf.write(preview, mono, int(sr), format="WAV", subtype="PCM_16")
     return mono, int(sr), preview.getvalue()
